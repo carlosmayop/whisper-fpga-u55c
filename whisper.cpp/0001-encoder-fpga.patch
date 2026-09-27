@@ -1,0 +1,627 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 06577bf1..980bab5f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -91,6 +91,7 @@ endif()
+ option(WHISPER_COREML                "whisper: enable Core ML framework"  OFF)
+ option(WHISPER_COREML_ALLOW_FALLBACK "whisper: allow non-CoreML fallback" OFF)
+ option(WHISPER_OPENVINO              "whisper: support for OpenVINO"      OFF)
++option(WHISPER_USE_FPGA              "whisper: use Alveo FPGA encoder"    OFF)
+ 
+ # Required for relocatable CMake package
+ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
+diff --git a/examples/cli/cli.cpp b/examples/cli/cli.cpp
+index 4e84c1b2..eac22cbc 100644
+--- a/examples/cli/cli.cpp
++++ b/examples/cli/cli.cpp
+@@ -1046,6 +1046,22 @@ int main(int argc, char ** argv) {
+     // initialize openvino encoder. this has no effect on whisper.cpp builds that don't have OpenVINO configured
+     whisper_ctx_init_openvino_encoder(ctx, nullptr, params.openvino_encode_device.c_str(), nullptr);
+ 
++#ifdef WHISPER_USE_FPGA
++    {
++        const char * weights_dir = getenv("WHISPER_FPGA_WEIGHTS");
++        if (!weights_dir) {
++            // default: test_vectors/ next to the model file
++            static std::string wdir = std::string(params.model).substr(0, params.model.rfind('/')) + "/../test_vectors";
++            weights_dir = wdir.c_str();
++        }
++        const char * xclbin = getenv("WHISPER_FPGA_XCLBIN");
++        if (!xclbin) xclbin = "whisper_encoder_top.xclbin"; // ignored by CPU stub
++        if (whisper_ctx_init_fpga_encoder(ctx, xclbin, weights_dir, 0) != 0) {
++            fprintf(stderr, "warning: FPGA encoder init failed, falling back to CPU\n");
++        }
++    }
++#endif
++
+     if (!params.grammar.empty()) {
+         auto & grammar = params.grammar_parsed;
+         if (is_file_exist(params.grammar.c_str())) {
+diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
+index 7622d0bf..791a20c3 100644
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -47,6 +47,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+         ggml-cpu/vec.cpp
+         ggml-cpu/ops.h
+         ggml-cpu/ops.cpp
++        ggml-cpu/fpga_backend.h
++        ggml-cpu/fpga_backend.cpp
+         )
+ 
+     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
+diff --git a/ggml/src/ggml-cpu/fpga_backend.cpp b/ggml/src/ggml-cpu/fpga_backend.cpp
+new file mode 100644
+index 00000000..483515d2
+--- /dev/null
++++ b/ggml/src/ggml-cpu/fpga_backend.cpp
+@@ -0,0 +1,165 @@
++#include "fpga_backend.h"
++#include <cstring>
++#include <cstdint>
++#include <cmath>
++#include <iostream>
++
++// Definiciones locales para no depender de ggml.h
++typedef uint16_t ggml_half;
++
++// Aseguramos alineación a 1 byte para leer la memoria tal cual está
++#pragma pack(push, 1)
++
++// Layout de memoria idéntico al struct block_q5_1 de GGML
++struct block_q5_1 {
++    ggml_half d;       // delta (2 bytes)
++    ggml_half m;       // min   (2 bytes)
++    uint8_t   qh[4];   // 5-th bit (4 bytes)
++    uint8_t   qs[16];  // nibbles (16 bytes)
++};
++
++// Layout estándar de block_q8_1
++struct block_q8_1 {
++    ggml_half d;       // delta (2 bytes)
++    ggml_half s;       // sum   (2 bytes)
++    int8_t    qs[32];  // quants (32 bytes)
++};
++
++#pragma pack(pop)
++
++// Función estándar IEEE 754 para convertir Half a Float
++// Corrige el error de escala (factor 64) que tenías antes.
++static float fp16_to_fp32(uint16_t h) {
++    uint32_t s = (h >> 15) & 0x1;
++    uint32_t e = (h >> 10) & 0x1F;
++    uint32_t m =  h        & 0x3FF;
++
++    if (e == 0) {
++        if (m == 0) return s ? -0.0f : 0.0f;
++        // Denormalizado (muy raro en pesos, pero por si acaso)
++        // Valor = (-1)^s * (m / 1024) * 2^-14
++        float val = (float)m / 1024.0f;
++        float factor = 6.1035156e-05f; // 2^-14
++        return s ? -val * factor : val * factor;
++    } else if (e == 31) {
++        // Infinito o NaN
++        return 0.0f; // En inferencia solemos preferir 0 a romper el cálculo
++    }
++
++    // Normalizado
++    // Nuevo exponente = e - 15 (bias fp16) + 127 (bias fp32)
++    uint32_t f_e = e - 15 + 127;
++    
++    // Construir float de 32 bits: S | E (8 bits) | M (23 bits)
++    // El mantisa de fp16 (10 bits) se mueve a la izquierda (bits más altos del mantisa fp32)
++    uint32_t f = (s << 31) | (f_e << 23) | (m << 13);
++    
++    float res;
++    memcpy(&res, &f, sizeof(float));
++    return res;
++}
++
++extern "C" {
++    void fpga_init(const char* path) { (void)path; }
++
++    // Implementación exacta de ggml_vec_dot_q5_1_q8_1
++    void fpga_vec_dot_q5_1_q8_1(int n, float* dst, const void* src0, const void* src1) {
++        static bool first_call = true; 
++        
++        const block_q5_1* x = (const block_q5_1*) src0;
++        const block_q8_1* y = (const block_q8_1*) src1;
++
++        if (first_call) { 
++            std::cout << "FPGA backend: ggml_vec_dot_q5_1_q8_1 called with n = " << n << "\n"; 
++            std::cout << "BLOCK Q5_1: d = " << fp16_to_fp32(x[0].d) << ", m = " << fp16_to_fp32(x[0].m) << ", qh[0] = " << *(uint32_t*)x[0].qh << ", qs[0] = " << (int)x[0].qs[0] << "\n";
++            std::cout << "BLOCK Q8_1: d = " << fp16_to_fp32(y[0].d) << ", s = " << fp16_to_fp32(y[0].s) << ", qs[0] = " << (int)y[0].qs[0] << "\n";
++            first_call = false; 
++        }
++        
++        
++        const int qk = 32;
++        const int nb = n / qk; 
++        
++        double sumf = 0.0;
++
++        for (int i = 0; i < nb; ++i) {
++            // 1. Extraer bits altos (qh)
++            // Usamos memcpy para evitar problemas de alineación/endianness
++            uint32_t qh;
++            memcpy(&qh, x[i].qh, sizeof(qh));
++
++            // 2. Acumuladores para la parte entera
++            int sumi0 = 0;
++            int sumi1 = 0;
++
++            for (int j = 0; j < qk/2; ++j) { // j de 0 a 15
++                // Extraer el bit 5 (high bit) correspondiente
++                // Lógica idéntica a ggml generic:
++                // xh_0: bit para la primera mitad (0-15)
++                const uint8_t xh_0 = ((qh >> j) << 4) & 0x10;
++                
++                // xh_1: bit para la segunda mitad (16-31)
++                // En generic usan: (qh >> (j + 12)) & 0x10
++                const uint8_t xh_1 = ((qh >> (j + 12))) & 0x10;
++
++                // Reconstruir los valores de 5 bits
++                // x0 = nibble bajo + bit alto
++                const int32_t x0 = (x[i].qs[j] & 0xF) | xh_0;
++                
++                // x1 = nibble alto + bit alto
++                const int32_t x1 = (x[i].qs[j] >>  4) | xh_1;
++
++                // Multiplicar por la entrada cuantizada (Q8_1)
++                // y[i].qs tiene 32 bytes firmados
++                sumi0 += (x0 * y[i].qs[j]);
++                sumi1 += (x1 * y[i].qs[j + qk/2]);
++            }
++
++            int sumi = sumi0 + sumi1;
++
++            // 3. Aplicar escalas y sumar al total
++            // Fórmula GGML: (d_x * d_y) * sum_i + (m_x * s_y)
++            
++            float d_x = fp16_to_fp32(x[i].d);
++            float m_x = fp16_to_fp32(x[i].m);
++            float d_y = fp16_to_fp32(y[i].d);
++            float s_y = fp16_to_fp32(y[i].s);
++            
++            sumf += (d_x * d_y) * sumi + (m_x * s_y);
++        }
++        
++        *dst = (float)sumf;
++    }
++
++    // GEMM: General Matrix-Matrix multiplication
++    // n_rows:   Filas de la matriz de pesos (ne01)
++    // n_cols:   Columnas de la matriz de pesos / Tamaño del vector (ne00)
++    // n_tokens: Número de tokens a procesar simultáneamente (ne11)
++    void fpga_gemm_q5_1_q8_1(int n_rows, int n_cols, int n_tokens, float* dst, const void* src0, const void* src1) {
++
++        const size_t weight_row_size = (n_cols / 32) * sizeof(block_q5_1); // Tamaño fila pesos
++        const size_t input_row_size  = (n_cols / 32) * sizeof(block_q8_1); // Tamaño fila input (Q8_1)
++        
++        const char* w_ptr = (const char*)src0;
++
++
++        for (int i = 0; i < n_rows; ++i) {
++            
++            // Para esta fila de pesos 'i', calculamos el producto escalar contra TODOS los tokens
++            for (int t = 0; t < n_tokens; ++t) {
++                
++                // Puntero al vector del token 't'
++                const char* x_ptr = (const char*)src1 + (t * input_row_size);
++                
++                
++                float* res_ptr = &dst[t * n_rows + i];
++
++                // Llamamos a la función vectorial (que la FPGA haría en paralelo hardware)
++                fpga_vec_dot_q5_1_q8_1(n_cols, res_ptr, w_ptr, x_ptr);
++            }
++
++            // Avanzamos el puntero de pesos una sola vez por fila
++            w_ptr += weight_row_size;
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/ggml/src/ggml-cpu/fpga_backend.h b/ggml/src/ggml-cpu/fpga_backend.h
+new file mode 100644
+index 00000000..15df9e59
+--- /dev/null
++++ b/ggml/src/ggml-cpu/fpga_backend.h
+@@ -0,0 +1,19 @@
++#ifndef FPGA_BACKEND_H
++#define FPGA_BACKEND_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void fpga_init(const char* path);
++
++// Firma simplificada: ya no necesita strides ni src1 es float*
++void fpga_vec_dot_q5_1_q8_1(int n, float* dst, const void* src0, const void* src1);
++
++void fpga_gemm_q5_1_q8_1(int n_rows, int n_cols, int n_tokens, float* dst, const void* src0, const void* src1);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+\ No newline at end of file
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index b1de2ae8..bdef8154 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -15,6 +15,7 @@
+ #include "ops.h"
+ #include "ggml.h"
+ #include "common.h"
++#include "fpga_backend.h"
+ 
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+ #include <malloc.h> // using malloc.h with MSC/MINGW
+@@ -1146,14 +1147,13 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+ 
+     const struct ggml_tensor * src0 = dst->src[0];
+     const struct ggml_tensor * src1 = dst->src[1];
+-
++    
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const bool src1_cont = ggml_is_contiguous(src1);
+ 
+     ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
+     enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+-
+     // broadcast factors
+     const int64_t r2 = ne12 / ne02;
+     const int64_t r3 = ne13 / ne03;
+@@ -1197,7 +1197,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+                 const int64_t i3 = i13;
+ 
+                 const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
+-
+                 // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
+                 //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
+                 //       the original src1 data pointer, so we should index using the indices directly
+@@ -1219,6 +1218,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+                     memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                 }
++
+             }
+         }
+     }
+@@ -1230,7 +1230,7 @@ void ggml_compute_forward_mul_mat(
+ 
+     const struct ggml_tensor * src0 = dst->src[0];
+     const struct ggml_tensor * src1 = dst->src[1];
+-
++    
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const int ith = params->ith;
+@@ -1285,7 +1285,6 @@ void ggml_compute_forward_mul_mat(
+     }
+ UseGgmlGemm1:;
+ #endif
+-
+     if (src1->type != vec_dot_type) {
+         char * wdata = params->wdata;
+ 
+@@ -1354,6 +1353,22 @@ UseGgmlGemm1:;
+ UseGgmlGemm2:;
+ #endif
+ 
++    // FPGA INJECTION
++    /*
++    if (src0->type == GGML_TYPE_Q5_1 && vec_dot_type == GGML_TYPE_Q8_1){
++        if (ith == 0){
++            int64_t n_rows = ne01;
++            int64_t n_cols = ne00;
++            //printf("N_ROWS: %ld N_COLS %ld\n", n_rows, n_cols);
++            int n_batches = ne11 * ne12 * ne13;
++
++            fpga_gemm_q5_1_q8_1(n_rows, n_cols, n_batches, (float*)dst->data, src0->data, params->wdata);
++        }
++
++        ggml_barrier(params->threadpool);
++        return;
++    }
++    */
+     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
+     const int64_t nr0 = ne0;
+ 
+diff --git a/include/whisper.h b/include/whisper.h
+index f4cc6bf7..ccb5be57 100644
+--- a/include/whisper.h
++++ b/include/whisper.h
+@@ -264,6 +264,17 @@ extern "C" {
+                     const char * device,
+                     const char * cache_dir);
+ 
++    // Initialize the FPGA encoder (Alveo U55C).
++    // xclbin_path : path to whisper_encoder_top.xclbin (ignored in CPU stub mode)
++    // weights_dir : directory with weight .bin files (test_vectors/)
++    // device_idx  : XRT device index (0 for first card)
++    // Returns 0 on success, non-zero on failure.
++    WHISPER_API int whisper_ctx_init_fpga_encoder(
++        struct whisper_context * ctx,
++                    const char * xclbin_path,
++                    const char * weights_dir,
++                  unsigned int   device_idx);
++
+     // Frees all allocated memory
+     WHISPER_API void whisper_free      (struct whisper_context * ctx);
+     WHISPER_API void whisper_free_state(struct whisper_state * state);
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 095a2791..6cc8243a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -48,6 +48,33 @@ if (WHISPER_OPENVINO)
+     find_package(OpenVINO REQUIRED COMPONENTS Runtime)
+ endif()
+ 
++if (WHISPER_USE_FPGA)
++    # Path to the directory containing libwhisper_fpga_encoder.so
++    # Override with -DFPGA_ENCODER_LIB_DIR=/path/to/build
++    if(NOT DEFINED FPGA_ENCODER_LIB_DIR)
++        set(FPGA_ENCODER_LIB_DIR "" CACHE PATH "Directory containing libwhisper_fpga_encoder.so")
++    endif()
++    # Path to the directory containing whisper_fpga_encoder.h
++    if(NOT DEFINED FPGA_ENCODER_INCLUDE_DIR)
++        set(FPGA_ENCODER_INCLUDE_DIR "" CACHE PATH "Directory containing whisper_fpga_encoder.h")
++    endif()
++
++    find_library(WHISPER_FPGA_LIB
++        NAMES whisper_fpga_encoder
++        HINTS "${FPGA_ENCODER_LIB_DIR}"
++        REQUIRED
++    )
++    find_path(WHISPER_FPGA_INCLUDE
++        NAMES whisper_fpga_encoder.h
++        HINTS "${FPGA_ENCODER_INCLUDE_DIR}"
++        REQUIRED
++    )
++
++    message(STATUS "FPGA encoder lib:     ${WHISPER_FPGA_LIB}")
++    message(STATUS "FPGA encoder include: ${WHISPER_FPGA_INCLUDE}")
++
++endif()
++
+ #
+ # libraries
+ #
+@@ -137,6 +164,12 @@ if (WHISPER_OPENVINO)
+     target_link_libraries(whisper PRIVATE whisper.openvino)
+ endif()
+ 
++if (WHISPER_USE_FPGA)
++    target_include_directories(whisper PRIVATE ${WHISPER_FPGA_INCLUDE})
++    target_link_libraries(whisper PRIVATE ${WHISPER_FPGA_LIB})
++    target_compile_definitions(whisper PUBLIC WHISPER_USE_FPGA)
++endif()
++
+ if (WHISPER_MKL)
+     target_link_libraries(whisper PRIVATE MKL::MKL)
+ endif()
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index 796bccfb..4eb28106 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -14,6 +14,10 @@
+ #include "openvino/whisper-openvino-encoder.h"
+ #endif
+ 
++#ifdef WHISPER_USE_FPGA
++#include "whisper_fpga_encoder.h"
++#endif
++
+ #include <atomic>
+ #include <algorithm>
+ #include <cassert>
+@@ -903,6 +907,10 @@ struct whisper_state {
+     whisper_openvino_context * ctx_openvino = nullptr;
+ #endif
+ 
++#ifdef WHISPER_USE_FPGA
++    whisper_fpga_context * ctx_fpga = nullptr;
++#endif
++
+     // [EXPERIMENTAL] token-level timestamps data
+     int64_t t_beg  = 0;
+     int64_t t_last = 0;
+@@ -1970,7 +1978,13 @@ static bool whisper_encode_external(const whisper_state & wstate) {
+     const bool use_openvino = wstate.ctx_openvino != nullptr;
+ #endif
+ 
+-    return use_coreml || use_openvino;
++#ifndef WHISPER_USE_FPGA
++    const bool use_fpga = false;
++#else
++    const bool use_fpga = wstate.ctx_fpga != nullptr;
++#endif
++
++    return use_coreml || use_openvino || use_fpga;
+ }
+ 
+ static struct ggml_cgraph * whisper_build_graph_conv(
+@@ -2016,6 +2030,32 @@ static struct ggml_cgraph * whisper_build_graph_conv(
+ 
+         ggml_set_name(cur, "embd_conv");
+         wstate.embd_conv = cur;
++#ifdef WHISPER_USE_FPGA
++    } else if (wstate.ctx_fpga != nullptr) {
++        // FPGA path: ggml computes conv (SIMD optimized), FPGA handles transformer.
++        {
++            cur = ggml_conv_1d_ph(ctx0, model.e_conv_1_w, mel, 1, 1);
++            cur = ggml_add(ctx0, cur, model.e_conv_1_b);
++
++            cur = ggml_gelu(ctx0, cur);
++
++            cur = ggml_conv_1d_ph(ctx0, model.e_conv_2_w, cur, 2, 1);
++            cur = ggml_add(ctx0, cur, model.e_conv_2_b);
++
++            cur = ggml_gelu(ctx0, cur);
++        }
++
++        ggml_set_name(cur, "embd_conv");
++        wstate.embd_conv = cur;
++
++        // Allocate embd_enc for the FPGA transformer output.
++        struct ggml_tensor * enc_out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_state, n_ctx);
++        ggml_set_input(enc_out);
++        ggml_set_output(enc_out);
++        ggml_set_name(enc_out, "embd_enc");
++        wstate.embd_enc = enc_out;
++        ggml_build_forward_expand(gf, enc_out);
++#endif
+     } else {
+         ggml_build_forward_expand(gf, mel);
+ 
+@@ -2157,6 +2197,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+                             0);
+ 
+                 cur = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, KQscale, 0.0f, 0.0f);
++                ggml_set_name(cur, "ENC_ATTN_FA");
+ 
+                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_ctx);
+             } else {
+@@ -2169,8 +2210,10 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+ 
+                 // K * Q
+                 struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
++                ggml_set_name(KQ, "ENC_ATTN_KQ");
+ 
+                 struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
++                ggml_set_name(KQ_soft_max, "ENC_ATTN_SM");
+ 
+                 struct ggml_tensor * V =
+                     ggml_cast(ctx0,
+@@ -2182,6 +2225,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+                             wctx.itype);
+ 
+                 struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
++                ggml_set_name(KQV, "ENC_ATTN_KQV");
+ 
+                 struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+ 
+@@ -2264,7 +2308,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+     //        wstate.get_buf_max_mem(3)/1e6);
+ 
+     ggml_free(ctx0);
+-
++    //ggml_graph_print(gf);
+     return gf;
+ }
+ 
+@@ -2355,6 +2399,21 @@ static struct ggml_cgraph * whisper_build_graph_cross(
+ //   - n_threads:  number of threads to use
+ //   - mel_offset: offset in the mel spectrogram (i.e. audio offset)
+ //
++// --- Timing de la atención del encoder (nodos ENC_ATTN_*) via eval callback ---
++static double g_enc_attn_ms = 0.0;
++static int g_enc_nodes_total = 0, g_enc_nodes_attn = 0;
++static std::chrono::high_resolution_clock::time_point g_enc_node_t0;
++static bool whisper_enc_attn_eval_cb(struct ggml_tensor * t, bool ask, void * /*ud*/) {
++    if (ask) { g_enc_node_t0 = std::chrono::high_resolution_clock::now(); return true; }
++    g_enc_nodes_total++;
++    if (t && strncmp(t->name, "ENC_ATTN_", 9) == 0) {
++        g_enc_nodes_attn++;
++        auto t1 = std::chrono::high_resolution_clock::now();
++        g_enc_attn_ms += std::chrono::duration<double, std::milli>(t1 - g_enc_node_t0).count();
++    }
++    return true;
++}
++
+ static bool whisper_encode_internal(
+         whisper_context & wctx,
+           whisper_state & wstate,
+@@ -2402,6 +2461,22 @@ static bool whisper_encode_internal(
+             ggml_backend_tensor_set(mel, wstate.inp_mel.data(), 0, ggml_nelements(mel)*sizeof(float));
+         }
+ 
++#if defined(WHISPER_USE_FPGA)
++        if (wstate.ctx_fpga != nullptr) {
++            // ggml computes conv1+conv2 (SIMD optimized)
++            if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
++                return false;
++            }
++            // FPGA handles transformer: embd_conv + pos_emb → embd_enc
++            if (!whisper_fpga_encode(
++                    wstate.ctx_fpga,
++                    (const float *) wstate.embd_conv->data,
++                    (int) wstate.embd_conv->ne[0],
++                    (float *) wstate.embd_enc->data)) {
++                return false;
++            }
++        } else
++#endif
+         if (!whisper_encode_external(wstate)) {
+             if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                 return false;
+@@ -2428,9 +2503,28 @@ static bool whisper_encode_internal(
+             return false;
+         }
+ 
++        // Timer atención encoder: activar callback por nodo
++        g_enc_attn_ms = 0.0;
++        ggml_backend_sched_set_eval_callback(sched, whisper_enc_attn_eval_cb, nullptr);
++
+         if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+             return false;
+         }
++
++        ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
++        // nodos flash-attn contados = 2x capas (flash_attn + su reshape con el mismo nombre)
++        int n_layers = (g_enc_nodes_attn > 0) ? (g_enc_nodes_attn / 2) : 1;
++        fprintf(stderr, "[ATTN-TIMER] atencion encoder (flash-attn) = %.3f ms  -> %.3f ms/capa (%d capas, n_threads=%d) [nodos: %d attn / %d total]\n",
++                g_enc_attn_ms, g_enc_attn_ms / n_layers, n_layers, n_threads, g_enc_nodes_attn, g_enc_nodes_total);
++    }
++
++    // diagnostic: print first 8 encoder output values for comparison
++    {
++        // ->data es puntero de device con backends GPU (CUDA): hay que copiarlo al host.
++        float embd[8];
++        ggml_backend_tensor_get(wstate.embd_enc, embd, 0, sizeof(embd));
++        fprintf(stderr, "[encode_internal] embd_enc[0..7]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
++            embd[0],embd[1],embd[2],embd[3],embd[4],embd[5],embd[6],embd[7]);
+     }
+ 
+     // cross
+@@ -3603,6 +3697,21 @@ int whisper_ctx_init_openvino_encoder(
+     return whisper_ctx_init_openvino_encoder_with_state(ctx, ctx->state, model_path, device, cache_dir);
+ }
+ 
++int whisper_ctx_init_fpga_encoder(
++        struct whisper_context * ctx,
++                    const char * xclbin_path,
++                    const char * weights_dir,
++                  unsigned int   device_idx) {
++#ifndef WHISPER_USE_FPGA
++    (void)ctx; (void)xclbin_path; (void)weights_dir; (void)device_idx;
++    return 1; // FPGA support not compiled in
++#else
++    if (!ctx || !ctx->state) return 1;
++    ctx->state->ctx_fpga = whisper_fpga_init(xclbin_path, weights_dir, device_idx);
++    return ctx->state->ctx_fpga ? 0 : 1;
++#endif
++}
++
+ struct whisper_context_params whisper_context_default_params() {
+     struct whisper_context_params result = {
+         /*.use_gpu              =*/ true,
+@@ -3821,6 +3930,13 @@ void whisper_free_state(struct whisper_state * state) {
+         }
+ #endif
+ 
++#ifdef WHISPER_USE_FPGA
++        if (state->ctx_fpga != nullptr) {
++            whisper_fpga_free(state->ctx_fpga);
++            state->ctx_fpga = nullptr;
++        }
++#endif
++
+         whisper_batch_free(state->batch);
+ 
+         ggml_backend_sched_free(state->sched_conv.sched);

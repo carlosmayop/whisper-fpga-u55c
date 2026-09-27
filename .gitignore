@@ -1,0 +1,48 @@
+# Artefactos de construccion de Vitis / Vivado
+_x/
+_xo_work/
+.Xil/
+.cache/
+.run/
+hls/
+logs/
+reports/
+analyzer_input/
+*.xo
+*.xclbin
+*.xclbin.info
+*.ltx
+*.link_summary
+*.jou
+*.log
+*.str
+*.backup.*
+vivado*.backup.*
+
+# Construccion del host
+build/
+build_xrt/
+build_stub/
+CMakeCache.txt
+CMakeFiles/
+
+# Pesos y vectores de prueba (se generan con tools/extract_weights.py)
+test_vectors/
+test_vectors_real/
+*.bin
+
+# Salidas del arnes de medida
+energia_resultados*.csv
+energia_unidades*.csv
+energia_salida_*.txt
+energia_log*.txt
+power_*.rpt
+util_*.rpt
+
+# Binarios compilados
+cpu_attn_mt
+cpu_attn_1t
+ggml_attn_bench
+attn_bench_small
+attn_bench_small_rand
+__pycache__
